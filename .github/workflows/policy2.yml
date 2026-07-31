@@ -1,0 +1,79 @@
+# Matice politiky ověřovatele — s EXIT KÓDY, piny a výstupem.
+# Pouze ověřuje už existující bundle. Nic nepodepisuje, nic nepublikuje.
+name: policy2
+
+on:
+  push:
+    paths: ['.github/workflows/policy2.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  matice:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ID_OK:   "https://github.com/Fiendishcode/sigstore-staging-probe/.github/workflows/probe.yml@refs/heads/main"
+      ISS_OK:  "https://token.actions.githubusercontent.com"
+      REPO_OK: "Fiendishcode/sigstore-staging-probe"
+      SHA_OK:  "f4eab7bee50f0c30faeecf4e1dd6d6018340032b"
+      REKOR:   "https://rekor.sigstage.dev"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: sigstore/cosign-installer@v3
+      - run: cosign initialize --mirror https://tuf-repo-cdn.sigstage.dev
+               --root https://raw.githubusercontent.com/sigstore/root-signing-staging/main/metadata/root.json
+
+      - name: Matice s exit kódy
+        run: |
+          set -uo pipefail
+          cd evidence
+          RC=0
+          zkus () {
+            popis="$1"; ocek="$2"; shift 2
+            out=$(cosign verify-blob --bundle bundle.json --rekor-url "$REKOR" "$@" statement.json 2>&1)
+            ec=$?
+            if [ "$ec" -eq 0 ]; then vysl=PASS; else vysl=FAIL; fi
+            if [ "$vysl" = "$ocek" ]; then stav="OK"; else stav="CHYBA"; RC=1; fi
+            echo "----------------------------------------------------------"
+            echo "TEST   : $popis"
+            echo "PIN    : $*"
+            echo "OCEK   : $ocek     VYSLEDEK: $vysl     EXIT: $ec     $stav"
+            echo "OUT    : $(echo "$out" | tr '\n' ' ' | cut -c1-130)"
+          }
+          zkus "POZITIVNI: spravna politika" PASS \
+            --certificate-identity "$ID_OK" --certificate-oidc-issuer "$ISS_OK"
+          zkus "jiny repozitar" FAIL \
+            --certificate-identity "https://github.com/Fiendishcode/jiny-repo/.github/workflows/probe.yml@refs/heads/main" \
+            --certificate-oidc-issuer "$ISS_OK"
+          zkus "jiny vlastnik" FAIL \
+            --certificate-identity "https://github.com/JinyVlastnik/sigstore-staging-probe/.github/workflows/probe.yml@refs/heads/main" \
+            --certificate-oidc-issuer "$ISS_OK"
+          zkus "jine workflow" FAIL \
+            --certificate-identity "https://github.com/Fiendishcode/sigstore-staging-probe/.github/workflows/jine.yml@refs/heads/main" \
+            --certificate-oidc-issuer "$ISS_OK"
+          zkus "jiny issuer" FAIL \
+            --certificate-identity "$ID_OK" --certificate-oidc-issuer "https://accounts.google.com"
+          zkus "jiny commit SHA" FAIL \
+            --certificate-identity "$ID_OK" --certificate-oidc-issuer "$ISS_OK" \
+            --certificate-github-workflow-sha "0000000000000000000000000000000000000000"
+          zkus "jiny repository pin" FAIL \
+            --certificate-identity "$ID_OK" --certificate-oidc-issuer "$ISS_OK" \
+            --certificate-github-workflow-repository "Fiendishcode/neco-jineho"
+          zkus "jiny trigger" FAIL \
+            --certificate-identity "$ID_OK" --certificate-oidc-issuer "$ISS_OK" \
+            --certificate-github-workflow-trigger "schedule"
+          zkus "jiny ref" FAIL \
+            --certificate-identity "$ID_OK" --certificate-oidc-issuer "$ISS_OK" \
+            --certificate-github-workflow-ref "refs/heads/utocnik"
+          zkus "KONTROLA: spravny commit SHA" PASS \
+            --certificate-identity "$ID_OK" --certificate-oidc-issuer "$ISS_OK" \
+            --certificate-github-workflow-sha "$SHA_OK"
+          zkus "KONTROLA: spravny repository" PASS \
+            --certificate-identity "$ID_OK" --certificate-oidc-issuer "$ISS_OK" \
+            --certificate-github-workflow-repository "$REPO_OK"
+          echo "=========================================================="
+          echo "CELKEM: $([ $RC -eq 0 ] && echo VSE_DLE_OCEKAVANI || echo NESEDI)"
+          exit $RC
