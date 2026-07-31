@@ -28,7 +28,7 @@ jobs:
 
       - name: Matice s exit kódy
         run: |
-          set -uo pipefail
+          set +e -u          # POZOR: Actions pousti bash -e; zamerne selhavajici test by krok ukoncil
           cd evidence
           RC=0
           zkus () {
