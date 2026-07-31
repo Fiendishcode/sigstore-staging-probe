@@ -1,0 +1,160 @@
+# Sigstore STAGING keyless probe — jednorázový experiment.
+#
+# ÚČEL: ověřit CELÝ keyless řetězec end-to-end, ale proti STAGING instanci
+# Sigstore, ne proti produkční Public Good Instance. Podepisuje se neškodný
+# minimální Statement v repozitáři bez jakékoli vazby na skutečný projekt.
+#
+# CO SE TÍM ZVEŘEJNÍ: jméno téhle organizace a její owner_id, jméno tohohle
+# repozitáře, cesta k tomuhle souboru, jeho větev a commit, čas běhu.
+# CO SE NEZVEŘEJNÍ: cokoli o skutečném projektu — jeho jméno, repository_id,
+# větve, cesty k workflow ani obsah.
+name: probe
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  keyless:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Instalovat cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Verze
+        run: cosign version
+
+      # --- 1 · minimální Statement ------------------------------------
+      - name: Vyrobit neškodný minimální Statement
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json
+          subj = b"probe-subject-bytes"
+          st = {
+            "schema": "probe/v0",
+            "subject_sha256": hashlib.sha256(subj).hexdigest(),
+            "verdict": "PROBE_ONLY",
+            "note": "throwaway staging experiment; no real data",
+          }
+          b = json.dumps(st, sort_keys=True, separators=(",", ":")).encode()
+          open("statement.json","wb").write(b)
+          print("statement:", b.decode())
+          print("digest   :", hashlib.sha256(b).hexdigest())
+          PY
+
+      # --- 2 · TUF kořen STAGINGU -------------------------------------
+      - name: cosign initialize (STAGING TUF)
+        id: init
+        continue-on-error: true
+        run: |
+          set -x
+          cosign initialize --mirror https://tuf-repo-cdn.sigstage.dev \
+            --root https://raw.githubusercontent.com/sigstore/root-signing-staging/main/metadata/root.json
+
+      # --- 3 · keyless podpis proti STAGINGU --------------------------
+      - name: Podepsat proti STAGING Fulcio + Rekor
+        id: sign
+        continue-on-error: true
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -x
+          cosign sign-blob --yes \
+            --fulcio-url https://fulcio.sigstage.dev \
+            --rekor-url https://rekor.sigstage.dev \
+            --oidc-issuer https://token.actions.githubusercontent.com \
+            --bundle bundle.json \
+            statement.json
+
+      - name: Výsledek podpisu
+        run: echo "sign outcome = ${{ steps.sign.outcome }}"
+
+      # --- 4 · co je v certifikátu (JÁDRO EXPERIMENTU) ----------------
+      - name: Rozebrat certifikát z bundlu
+        if: steps.sign.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, json
+          b = json.load(open("bundle.json"))
+          print("=== KLICE BUNDLU:", sorted(b))
+          cert = None
+          for path in (("cert",), ("verificationMaterial","certificate","rawBytes"),
+                       ("verificationMaterial","x509CertificateChain","certificates")):
+              cur = b
+              try:
+                  for p in path: cur = cur[p]
+                  cert = cur if isinstance(cur, str) else cur[0].get("rawBytes")
+                  if cert: break
+              except Exception: pass
+          open("cert.pem","w").write(
+              cert if cert.startswith("-----") else
+              "-----BEGIN CERTIFICATE-----\n" + cert + "\n-----END CERTIFICATE-----\n")
+          print("=== TYP ZAZNAMU / obsah bundlu (bez podpisu):")
+          print(json.dumps({k: (v if not isinstance(v,(dict,list)) else "…")
+                            for k,v in b.items()}, indent=2)[:1500])
+          PY
+          echo "=== CELY CERTIFIKAT VCETNE ROZSIRENI:"
+          openssl x509 -in cert.pem -noout -text || true
+
+      # --- 5 · nezávislé ověření --------------------------------------
+      - name: Ověřit bundle (nezávisle)
+        if: steps.sign.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -x
+          cosign verify-blob --bundle bundle.json \
+            --rekor-url https://rekor.sigstage.dev \
+            --certificate-identity-regexp ".*sigstore-staging-probe.*" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            statement.json
+
+      # --- 6 · REPLAY: změněný Statement, týž bundle ------------------
+      - name: REPLAY — pozměněné tělo musí být ODMÍTNUTO
+        if: steps.sign.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -x
+          printf '{"schema":"probe/v0","verdict":"TAMPERED"}' > podvrh.json
+          cosign verify-blob --bundle bundle.json \
+            --rekor-url https://rekor.sigstage.dev \
+            --certificate-identity-regexp ".*sigstore-staging-probe.*" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            podvrh.json && echo "PRUSVIH: podvrh PROSEL" || echo "SPRAVNE: podvrh odmitnut"
+
+      # --- 7 · chování --tlog-upload=false ----------------------------
+      - name: Podpis BEZ zápisu do logu
+        id: notlog
+        continue-on-error: true
+        run: |
+          set -x
+          cosign sign-blob --yes \
+            --fulcio-url https://fulcio.sigstage.dev \
+            --rekor-url https://rekor.sigstage.dev \
+            --oidc-issuer https://token.actions.githubusercontent.com \
+            --tlog-upload=false \
+            --bundle bundle-notlog.json \
+            statement.json
+      - name: Výsledek bez logu
+        run: echo "tlog-upload=false outcome = ${{ steps.notlog.outcome }}"
+
+      - name: Uložit artefakty k rozboru
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-vystup
+          path: |
+            statement.json
+            bundle.json
+            bundle-notlog.json
+            cert.pem
+          if-no-files-found: warn
