@@ -1,0 +1,50 @@
+# Matice politiky ověřovatele T01–T11 s ÚPLNÝM (nezkráceným) výstupem.
+#
+# Oproti policy2.yml: matici řídí Python (tools/matice.py), ne shell. Tím
+# odpadá jak ořezávání výstupu, tak závislost na chování `bash -e`, kvůli
+# které první běh policy2 skončil po prvním záměrně selhávajícím testu.
+#
+# Tento workflow POUZE OVĚŘUJE už existující bundle. Nic nepodepisuje,
+# nic nepublikuje a ZÁMĚRNĚ nemá `id-token: write` — což zároveň dokládá,
+# že ověřovatel podepisovací oprávnění nepotřebuje.
+name: policy3
+
+on:
+  push:
+    paths:
+      - '.github/workflows/policy3.yml'
+      - 'tools/matice.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read          # ZÁMĚRNĚ BEZ id-token
+
+jobs:
+  matice:
+    name: Matice T01-T11 (uplny vystup)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Verze nástrojů
+        run: |
+          cosign version
+          python3 --version
+
+      - name: TUF kořen STAGINGU
+        run: |
+          cosign initialize --mirror https://tuf-repo-cdn.sigstage.dev \
+            --root https://raw.githubusercontent.com/sigstore/root-signing-staging/main/metadata/root.json
+
+      - name: Matice T01-T11
+        run: python3 tools/matice.py
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: matice-full
+          path: matice-full.json
+          if-no-files-found: error
