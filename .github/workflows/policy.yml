@@ -1,0 +1,198 @@
+# Doplnění spike — body 1, 2 a 3 auditorova zadání.
+#
+# Job 1 (policy): NEGATIVNÍ testy politiky ověřovatele proti UŽ EXISTUJÍCÍMU
+#                 stagingovému Statementu a bundlu z evidence/. Nic nepodepisuje.
+# Job 2 (oddelene): ověření v SAMOSTATNÉM jobu, pouze z přenesených souborů,
+#                 bez přístupu k podepisovacímu jobu. Navíc pokus o ověření
+#                 nezávislou knihovnou sigstore-python.
+# Job 3 (dsse):   minimální DSSE/in-toto test proti STAGINGU s neškodným
+#                 obsahem — zjišťuje, co se u DSSE reálně publikuje.
+name: policy
+
+on:
+  push:
+    paths: ['.github/workflows/policy.yml', 'evidence/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  ID_OK:   "https://github.com/Fiendishcode/sigstore-staging-probe/.github/workflows/probe.yml@refs/heads/main"
+  ISS_OK:  "https://token.actions.githubusercontent.com"
+  REPO_OK: "Fiendishcode/sigstore-staging-probe"
+  SHA_OK:  "f4eab7bee50f0c30faeecf4e1dd6d6018340032b"
+  REKOR:   "https://rekor.sigstage.dev"
+
+jobs:
+  # ---------------------------------------------------------------- 1
+  policy:
+    name: 1 · Negativní testy politiky
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: sigstore/cosign-installer@v3
+      - run: cosign initialize --mirror https://tuf-repo-cdn.sigstage.dev
+               --root https://raw.githubusercontent.com/sigstore/root-signing-staging/main/metadata/root.json
+
+      - name: Matice — správná politika MUSÍ projít, každá špatná MUSÍ selhat
+        run: |
+          set -uo pipefail
+          cd evidence
+          zkus () {   # $1 = popis, $2 = ocekavani (PASS/FAIL), zbytek = argumenty
+            local popis="$1"; local ocek="$2"; shift 2
+            if cosign verify-blob --bundle bundle.json --rekor-url "$REKOR" \
+                 "$@" statement.json >/dev/null 2>&1; then vysl=PASS; else vysl=FAIL; fi
+            if [ "$vysl" = "$ocek" ]; then stav="OK  "; else stav="CHYBA"; RC=1; fi
+            printf '%s  %-34s ocekavano=%-4s vysledek=%s\n' "$stav" "$popis" "$ocek" "$vysl"
+          }
+          RC=0
+          echo "### POZITIVNI KONTROLA"
+          zkus "spravna politika" PASS \
+            --certificate-identity "$ID_OK" --certificate-oidc-issuer "$ISS_OK"
+          echo
+          echo "### NEGATIVNI TESTY"
+          zkus "jiny repozitar (identity)" FAIL \
+            --certificate-identity "https://github.com/Fiendishcode/jiny-repo/.github/workflows/probe.yml@refs/heads/main" \
+            --certificate-oidc-issuer "$ISS_OK"
+          zkus "jiny vlastnik (identity)" FAIL \
+            --certificate-identity "https://github.com/JinyVlastnik/sigstore-staging-probe/.github/workflows/probe.yml@refs/heads/main" \
+            --certificate-oidc-issuer "$ISS_OK"
+          zkus "jine workflow (identity)" FAIL \
+            --certificate-identity "https://github.com/Fiendishcode/sigstore-staging-probe/.github/workflows/jine.yml@refs/heads/main" \
+            --certificate-oidc-issuer "$ISS_OK"
+          zkus "jiny issuer" FAIL \
+            --certificate-identity "$ID_OK" \
+            --certificate-oidc-issuer "https://accounts.google.com"
+          zkus "jiny commit SHA" FAIL \
+            --certificate-identity "$ID_OK" --certificate-oidc-issuer "$ISS_OK" \
+            --certificate-github-workflow-sha "0000000000000000000000000000000000000000"
+          zkus "jiny repository (GH pin)" FAIL \
+            --certificate-identity "$ID_OK" --certificate-oidc-issuer "$ISS_OK" \
+            --certificate-github-workflow-repository "Fiendishcode/neco-jineho"
+          zkus "jiny trigger (GH pin)" FAIL \
+            --certificate-identity "$ID_OK" --certificate-oidc-issuer "$ISS_OK" \
+            --certificate-github-workflow-trigger "schedule"
+          zkus "jiny ref (GH pin)" FAIL \
+            --certificate-identity "$ID_OK" --certificate-oidc-issuer "$ISS_OK" \
+            --certificate-github-workflow-ref "refs/heads/utocnik"
+          echo
+          echo "### KONTROLNI PINY, KTERE MUSI PROJIT"
+          zkus "spravny commit SHA" PASS \
+            --certificate-identity "$ID_OK" --certificate-oidc-issuer "$ISS_OK" \
+            --certificate-github-workflow-sha "$SHA_OK"
+          zkus "spravny repository" PASS \
+            --certificate-identity "$ID_OK" --certificate-oidc-issuer "$ISS_OK" \
+            --certificate-github-workflow-repository "$REPO_OK"
+          echo
+          echo "CELKOVY VYSLEDEK: $([ $RC -eq 0 ] && echo VSE_DLE_OCEKAVANI || echo NEKTERY_TEST_NESEDI)"
+          exit $RC
+
+  # ---------------------------------------------------------------- 2
+  oddelene:
+    name: 2 · Oddělené ověření (jiný job, jen ze souborů)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read          # ZÁMĚRNĚ BEZ id-token — verifier ho nepotřebuje
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: cosign v čistém jobu, vlastní initialize
+        run: |
+          set -x
+          curl -sSL -o /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.5.2/cosign-linux-amd64
+          chmod +x /tmp/cosign
+          /tmp/cosign initialize --mirror https://tuf-repo-cdn.sigstage.dev \
+            --root https://raw.githubusercontent.com/sigstore/root-signing-staging/main/metadata/root.json
+          cd evidence
+          /tmp/cosign verify-blob --bundle bundle.json --rekor-url "$REKOR" \
+            --certificate-identity "$ID_OK" --certificate-oidc-issuer "$ISS_OK" \
+            statement.json
+          echo "ODDELENE OVERENI: OK"
+
+      - name: Pokus o ověření NEZÁVISLOU knihovnou (sigstore-python)
+        continue-on-error: true
+        run: |
+          set -x
+          python3 -m pip install --quiet sigstore
+          python3 -m sigstore --version
+          cd evidence
+          python3 - <<'PY'
+          import json, base64, pathlib
+          b = json.load(open("bundle.json"))
+          print("Legacy cosign bundle -> klice:", sorted(b))
+          print("sigstore-python ocekava novy format (Bundle protobuf).")
+          print("Pokus o prevod neni soucasti spike; vysledek se hlasi jak dopadl.")
+          PY
+          python3 -m sigstore verify identity \
+            --bundle bundle.json \
+            --cert-identity "$ID_OK" \
+            --cert-oidc-issuer "$ISS_OK" \
+            statement.json
+
+  # ---------------------------------------------------------------- 3
+  dsse:
+    name: 3 · DSSE / in-toto proti stagingu (neškodný obsah)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: sigstore/cosign-installer@v3
+      - run: cosign initialize --mirror https://tuf-repo-cdn.sigstage.dev
+               --root https://raw.githubusercontent.com/sigstore/root-signing-staging/main/metadata/root.json
+
+      - name: Neškodný predikát s ROZPOZNATELNYM markerem
+        run: |
+          cat > predicate.json <<'EOF'
+          {"marker":"DSSE_BODY_MARKER_9f3a","note":"harmless probe predicate"}
+          EOF
+          echo "probe-dsse-subject" > subject.txt
+          cat predicate.json
+
+      - name: attest-blob proti STAGINGU
+        id: attest
+        continue-on-error: true
+        run: |
+          set -x
+          cosign attest-blob --yes \
+            --fulcio-url https://fulcio.sigstage.dev \
+            --rekor-url "$REKOR" \
+            --oidc-issuer "$ISS_OK" \
+            --predicate predicate.json \
+            --type custom \
+            --bundle dsse-bundle.json \
+            subject.txt
+
+      - name: CO SE U DSSE REALNE PUBLIKUJE
+        if: steps.attest.outcome == 'success'
+        continue-on-error: true
+        run: |
+          python3 - <<'PY'
+          import base64, json
+          b = json.load(open("dsse-bundle.json"))
+          print("=== klice DSSE bundlu:", sorted(b))
+          rb = b.get("rekorBundle") or {}
+          p = rb.get("Payload", {})
+          print("=== logIndex:", p.get("logIndex"))
+          body = p.get("body")
+          if body:
+              d = json.loads(base64.b64decode(body))
+              print("=== kind/apiVersion:", d.get("kind"), d.get("apiVersion"))
+              raw = json.dumps(d)
+              print("=== JE MARKER TELA V ZAZNAMU?",
+                    "ANO — TELO SE PUBLIKUJE" if "DSSE_BODY_MARKER_9f3a" in raw
+                    else "NE — v zaznamu marker neni")
+              print("=== spec (zkraceno):", json.dumps(d.get("spec"))[:600])
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dsse-vystup
+          path: |
+            dsse-bundle.json
+            predicate.json
+          if-no-files-found: warn
